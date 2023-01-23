@@ -13,6 +13,7 @@ import pandas as pd
 import spacy
 import geopandas as gpd
 from OSMPythonTools.nominatim import Nominatim
+import itertools
 
 LOC = namedtuple('LOC', ['loc', 'displayName', 'geometry', 'area'])
 geod = Geod(ellps="WGS84")
@@ -49,21 +50,23 @@ def cleaning_geometry(geometry):
     else :
         return geometry
 
-def safe_le(a, b):
+def safe_le(a, b) -> bool:
     if b is None or a is None:
         return True
     else :
         return a <= b
 
-def geocode_root(country:str)->str:
-    l_country = country.split(';')
-    return ";".join([defaultvalue(country).displayName.replace('/','-') for country in l_country ])
-
-def safe_ge(a, b):
+def safe_ge(a, b) -> bool:
     if b is None or a is None:
         return True
     else :
         return a >= b
+
+def geocode_root(country:str) -> str:
+    l_country = country.split(';')
+    return ";".join([defaultvalue(country).displayName.replace('/','-') for country in l_country ])
+
+
 
 class OSMGeoParser():
 
@@ -74,11 +77,14 @@ class OSMGeoParser():
         self.area_threshold_high = area_threshold_high
 
 
-    def from_dataframe(self, dataframe: pd.DataFrame, columns:list, root_in=None, union=True, wrapper=None,
-      n_jobs=-1, prefer='threads') -> gpd.GeoDataFrame:
-
+    def from_dataframe(self, dataframe: pd.DataFrame, columns:list, root_in=None, wrapper=None, \
+        how=None, enforce=None, n_jobs=-1, prefer='threads') -> gpd.GeoDataFrame:
         """
-
+        - dataframe: pd.DataFrame
+        - columns: list of strings, 
+            columns in dataframe on which to apply the geoparsing 
+        - root_in: string, 
+            column name in dataframe to check if the location found is within the country described in this column
         - wrapper: func, default : None 
             wrapper is used to filter the row  of the dataframe on
             which the geoparsing is done. It can be also used to process the texts inside the columns.
@@ -98,6 +104,10 @@ class OSMGeoParser():
             If None, the wrapper is simply the function safe_join that remove the ponctuation
             of each column before joining the strings on ','. 
 
+        - how : str - union or intersect, default : None
+            the method to merge the polygons or not if several spatial entities are found for one row
+        - enforce : name of columns
+            columns used to ByPass NLP
         -----------------------------------
         Returns:
             _type_: GeoPandas.GeoDataFrame
@@ -111,13 +121,14 @@ class OSMGeoParser():
             dataframe[column] = dataframe[column].astype(str)
 
         texts = dataframe.apply(lambda row:wrapper(row, columns=columns), axis=1).to_list()
+        enforce = dataframe.apply(lambda row:wrapper(row, columns=enforce), axis=1).to_list()
 
-        geometry = self.geoparse_list(texts, n_jobs=n_jobs, prefer=prefer, union=union,\
-             index=dataframe.index)
+        geometry = self.geoparse_list(texts, n_jobs=n_jobs, prefer=prefer, how=how,\
+             index=dataframe.index, enforce=enforce)
         dataframe['join_index'] = dataframe.index
         data = dataframe.merge(geometry, on='join_index', validate='one_to_many')
 
-        gdf = gpd.GeoDataFrame(data, geometry='geometry', crs='epsg:4326')
+        gdf = gpd.GeoDataFrame(data, geometry='geometry', crs='epsg:4326').drop_duplicates()
         if root_in is not None and root_in in gdf.columns:
             gdf['root_in'] = gdf[root_in].apply(geocode_root)
             gdf['valid'] = gdf.apply(lambda x:x.root in x.root_in, axis=1)
@@ -131,8 +142,8 @@ class OSMGeoParser():
 
 
 
-    def geoparse_list(self, texts:list, n_jobs=-1, prefer='threads', union=True, index=None, 
-    NER = ['LOC', 'GPE']) -> list:
+    def geoparse_list(self, texts:list, n_jobs=-1, prefer='threads', how=None, index=None, 
+    NER = ['LOC', 'GPE'], enforce=None) -> list:
         nlp = spacy.load("xx_ent_wiki_sm", enable=['ner'])
 
         #Entity recognition
@@ -140,33 +151,41 @@ class OSMGeoParser():
 
         #Retrieving LOC
         self.l_entities = []
-        for doc in docs:
+        for i,doc in enumerate(docs):
             entities = {key: list(g) for key, g in groupby(sorted(doc.ents, key=lambda x: x.label_), lambda x: x.label_)}
             ents = []
             for ner in NER:
                 if ner in entities.keys():
                     ents.extend(entities[ner])
+
+            if enforce is not None:
+                ents.extend([enforce[i]])
     
             if len(ents) == 0:
                 self.l_entities.append(None)
             else:
                 self.l_entities.append(ents)
 
+            
+
         #GeoParsing
         if index is not None:
             gdfs = Parallel(n_jobs=n_jobs, prefer=prefer, verbose=5)\
-                (delayed(self.osm_research)(locs, printtree=False, union=union, index=i) \
+                (delayed(self.osm_research)(locs, printtree=False, how=how, index=i) \
                     for i,locs in zip(index,self.l_entities))
         else:
             gdfs = Parallel(n_jobs=n_jobs, prefer=prefer, verbose=5)\
-                (delayed(self.osm_research)(locs, printtree=False, union=union) for locs in self.l_entities)
+                (delayed(self.osm_research)(locs, printtree=False, how=how) for locs in self.l_entities)
             
         return gpd.GeoDataFrame(pd.concat(gdfs), geometry='geometry', crs='epsg:4326') 
 
 
-    def osm_research(self, locs : list, printtree=True, union=True, index=0):
+    def osm_research(self, locs : list, printtree=True, how=None, index=0):
         if locs is None:
             return None
+
+        if how is None:
+            how = ''
             
         local_dlocs = {}
         local_dlocs = self.recursive_research(locs, local_dlocs)
@@ -193,13 +212,24 @@ class OSMGeoParser():
                 attr.append([leaf.node_name, leaf.root.node_name, loc.geometry, loc.area, index])
             attr = np.array(attr)
 
-            if union:
-                data = [[",".join(attr.T[0]), ",".join(attr.T[1]), unary_union(attr.T[2]), attr.T[3].sum(), index]]
+            if how.lower() == 'union':
+                geom = unary_union(attr.T[2])
+                area = abs(geod.geometry_area_perimeter(geom)[0])/1e6
+                data = [['union: '+",".join(attr.T[0]), ",".join(set(attr.T[1])), geom, area, index]]
+
+            elif how.lower() == 'intersection':
+                geoms = attr.T[2]
+                intersections = [poly[0].intersection(poly[1]) for poly in  itertools.combinations(geoms, 2) if poly[0].intersects(poly[1])]
+                n_intersections = [poly[0] for poly in  itertools.combinations(geoms, len(geoms)) if not bool(sum([poly[0].intersects(poly_bis) for poly_bis in poly[1:]]))]
+                geom = unary_union(intersections + n_intersections)
+                area = abs(geod.geometry_area_perimeter(geom)[0])/1e6
+                data = [['intersection: '+",".join(attr.T[0]), ",".join(set(attr.T[1])), geom, area, index]]
+
             else:
                 data = attr
 
             gdf = gpd.GeoDataFrame(data, columns=['name', 'root', 'geometry', 'area_km', 'join_index'], geometry='geometry', \
-                crs='epsg:4326')
+                crs='epsg:4326').drop_duplicates(subset='geometry')
 
         return gdf 
 
