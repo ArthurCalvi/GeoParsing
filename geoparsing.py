@@ -3,6 +3,7 @@ import string
 from collections import namedtuple
 from shapely import wkt
 from shapely.ops import unary_union
+from shapely.geometry.multipolygon import MultiPolygon
 from pyproj import Geod
 from collections import defaultdict
 from bigtree import  print_tree, list_to_tree
@@ -220,8 +221,9 @@ class OSMGeoParser():
             elif how.lower() == 'intersection':
                 geoms = attr.T[2]
                 intersections = [poly[0].intersection(poly[1]) for poly in  itertools.combinations(geoms, 2) if poly[0].intersects(poly[1])]
-                n_intersections = [poly[0] for poly in  itertools.combinations(geoms, len(geoms)) if not bool(sum([poly[0].intersects(poly_bis) for poly_bis in poly[1:]]))]
-                geom = unary_union(intersections + n_intersections)
+                n_intersections = [poly[0] for poly in  itertools.combinations(geoms, len(geoms)) if not any([poly[0].intersects(poly_bis) for poly_bis in poly[1:]])]
+                print() #black magic (if not n_intersections is not taken into account)
+                geom = unary_union(intersections+n_intersections) #change -> coverage_union or MultiPolygon  
                 area = abs(geod.geometry_area_perimeter(geom)[0])/1e6
                 data = [['intersection: '+",".join(attr.T[0]), ",".join(set(attr.T[1])), geom, area, index]]
 
