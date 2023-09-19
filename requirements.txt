@@ -7,3 +7,5 @@ pandas==1.5.1
 pyproj==3.4.0
 Shapely==1.8.5.post1
 spacy==3.4.4
+googlemaps==4.10.0
+```

@@ -14,6 +14,7 @@ import spacy
 import geopandas as gpd
 from OSMPythonTools.nominatim import Nominatim
 import itertools
+import googlemaps
 
 LOC = namedtuple('LOC', ['loc', 'displayName', 'geometry', 'area'])
 geod = Geod(ellps="WGS84")
@@ -66,15 +67,21 @@ def geocode_root(country:str) -> str:
     l_country = country.split(';')
     return ";".join([defaultvalue(country).displayName.replace('/','-') for country in l_country ])
 
-
-
 class OSMGeoParser():
 
-    def __init__(self, area_threshold_low = None, area_threshold_high = None):
+    def __init__(self, area_threshold_low = None, area_threshold_high = None, googlemapsAPIkey=None):
         self.dlocs = {}
         self.dleaf_loc = {}
         self.area_threshold_low = area_threshold_low
         self.area_threshold_high = area_threshold_high
+        self.googlemapsAPIkey = googlemapsAPIkey
+        self.googlemaps = None
+        if self.googlemapsAPIkey is not None:
+            try:
+                self.googlemaps = googlemaps.Client(key=self.googlemapsAPIkey)
+            except:
+                print('googlemaps API key not valid')
+                self.googlemaps = None
 
 
     def from_dataframe(self, dataframe: pd.DataFrame, columns:list, root_in=None, wrapper=None, \
@@ -177,7 +184,7 @@ class OSMGeoParser():
             gdfs = Parallel(n_jobs=n_jobs, prefer=prefer, verbose=5)\
                 (delayed(self.osm_research)(locs, printtree=False, how=how) for locs in self.l_entities)
             
-        return gpd.GeoDataFrame(pd.concat(gdfs), geometry='geometry', crs='epsg:4326') 
+        return gpd.GeoDataFrame(pd.concat(gdfs), geometry='geometry', crs='epsg:4326').dropna(how='all')
 
 
     def osm_research(self, locs : list, printtree=True, how=None, index=0):
@@ -208,25 +215,38 @@ class OSMGeoParser():
             attr = []
             for leaf in leaves:
                 loc = self.dleaf_loc[leaf.node_name]
-                loc = self.dlocs[loc]
-                attr.append([leaf.node_name, leaf.root.node_name, cleaning_geometry(loc.geometry), loc.area, index])
-            attr = np.array(attr)
+                try :
+                    loc = self.dlocs[loc]
+                except :
+                    print('loc: ', loc)
+                    print('leaf: ', leaf)
 
-            if how.lower() == 'union':
-                geom = unary_union(attr.T[2])
-                area = abs(geod.geometry_area_perimeter(geom)[0])/1e6
-                data = [['union: '+",".join(attr.T[0]), ",".join(set(attr.T[1])), geom, area, index]]
+                if loc.geometry is not None:
+                    attr.append([leaf.node_name, leaf.root.node_name, cleaning_geometry(loc.geometry), loc.area, index])
 
-            elif how.lower() == 'intersection':
-                geoms = attr.T[2]
-                intersections = [poly[0].intersection(poly[1]) for poly in  itertools.combinations(geoms, 2) if poly[0].intersects(poly[1])]
-                n_intersections = [poly[0] for poly in  itertools.combinations(geoms, len(geoms)) if not all([poly[0].intersects(poly_bis) for poly_bis in poly[1:]])]
-                geom = unary_union(intersections+n_intersections) #change -> coverage_union or MultiPolygon  
-                area = abs(geod.geometry_area_perimeter(geom)[0])/1e6
-                data = [['intersection: '+",".join(attr.T[0]), ",".join(set(attr.T[1])), geom, area, index]]
+            if len(attr) > 0:
+                attr = np.array(attr)
 
-            else:
-                data = attr
+                if len(attr) > 1:
+                    if how.lower() == 'union':
+                        geom = unary_union(attr.T[2])
+                        area = abs(geod.geometry_area_perimeter(geom)[0])/1e6
+                        data = [['union: '+",".join(attr.T[0]), ",".join(set(attr.T[1])), geom, area, index]]
+
+                    elif how.lower() == 'intersection':
+                        geoms = attr.T[2]
+                        intersections = [poly[0].intersection(poly[1]) for poly in  itertools.combinations(geoms, 2) if poly[0].intersects(poly[1])]
+                        n_intersections = [poly[0] for poly in  itertools.combinations(geoms, len(geoms)) if not all([poly[0].intersects(poly_bis) for poly_bis in poly[1:]])]
+                        geom = unary_union(intersections+n_intersections) #change -> coverage_union or MultiPolygon  
+                        area = abs(geod.geometry_area_perimeter(geom)[0])/1e6
+                        data = [['intersection: '+",".join(attr.T[0]), ",".join(set(attr.T[1])), geom, area, index]]
+                    else:
+                        data = attr
+                else:
+                    data = attr
+
+            else :
+                data = [[np.NaN]*5]
 
             gdf = gpd.GeoDataFrame(data, columns=['name', 'root', 'geometry', 'area_km', 'join_index'], geometry='geometry', \
                 crs='epsg:4326').drop_duplicates(subset='geometry')
@@ -243,10 +263,21 @@ class OSMGeoParser():
 
         return [list_to_tree(ltree, duplicate_name_allowed=True) for ltree in dtree.values()] 
 
+
+    def wrapper_loc(self, loc):
+        if self.googlemaps is not None:
+            try :
+                loc = self.googlemaps.find_place(input=loc, input_type='textquery', fields=['formatted_address'])['candidates'][0]['formatted_address']
+            except :
+                pass
+
+        return loc
+    
     def recursive_research(self, locs : list, local_dlocs: dict, count=0, wkt_=True) -> None:
 
         for loc in locs:
-            spatial_entity = self.dlocs.setdefault(loc, defaultvalue(loc, wkt_=wkt_))
+
+            spatial_entity = self.dlocs.setdefault(loc, defaultvalue(self.wrapper_loc(loc), wkt_=wkt_))
 
             if spatial_entity.displayName is None and count < 1:
                 sub_locs = str(loc).split(' ')
@@ -272,7 +303,7 @@ class OSMGeoParser():
         loc = self.dleaf_loc.setdefault(leaf_name, default_leaf_name)
 
         #updatedict
-        loc = self.dlocs.setdefault(loc, defaultvalue(loc, wkt_=True))
+        loc = self.dlocs.setdefault(loc, defaultvalue(self.wrapper_loc(loc), wkt_=True))
 
         if safe_ge(loc.area, self.area_threshold_low) and safe_le(loc.area, self.area_threshold_high):
             return leaf
